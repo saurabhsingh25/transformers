@@ -1,11 +1,9 @@
 from collections import Counter
-
 import datasets
-
 import transformers
 from transformers.convert_slow_tokenizer import SLOW_TO_FAST_CONVERTERS
 from transformers.utils import logging
-
+import time
 
 logging.set_verbosity_info()
 
@@ -13,31 +11,19 @@ TOKENIZER_CLASSES = {
     name: (getattr(transformers, name), getattr(transformers, name + "Fast")) for name in SLOW_TO_FAST_CONVERTERS
 }
 
-dataset = datasets.load_dataset("facebook/xnli", split="test+validation")  # no-script
+dataset = datasets.load_dataset("facebook/xnli", split="test+validation")
 
-total = 0
-perfect = 0
-imperfect = 0
-wrong = 0
+total, perfect, imperfect, wrong = 0, 0, 0, 0
 
 
 def check_diff(spm_diff, tok_diff, slow, fast):
     if spm_diff == list(reversed(tok_diff)):
-        # AAA -> AA+A vs A+AA case.
         return True
     elif len(spm_diff) == len(tok_diff) and fast.decode(spm_diff) == fast.decode(tok_diff):
-        # Second order OK
-        # Barrich -> Barr + ich vs Bar + rich
         return True
     spm_reencoded = slow.encode(slow.decode(spm_diff))
     tok_reencoded = fast.encode(fast.decode(spm_diff))
     if spm_reencoded != spm_diff and spm_reencoded == tok_reencoded:
-        # Type 3 error.
-        # Snehagatha ->
-        #       Sne, h, aga, th, a
-        #       Sne, ha, gat, ha
-        # Encoding the wrong with sp does not even recover what spm gave us
-        # It fits tokenizer however...
         return True
     return False
 
@@ -46,15 +32,13 @@ def check_LTR_mark(line, idx, fast):
     enc = fast.encode_plus(line)[0]
     offsets = enc.offsets
     curr, prev = offsets[idx], offsets[idx - 1]
-    if curr is not None and line[curr[0] : curr[1]] == "\u200f":
+    if curr is not None and line[curr[0]:curr[1]] == "\u200f":
         return True
-    if prev is not None and line[prev[0] : prev[1]] == "\u200f":
+    if prev is not None and line[prev[0]:prev[1]] == "\u200f":
         return True
 
 
 def check_details(line, spm_ids, tok_ids, slow, fast):
-    # Encoding can be the same with same result AAA -> A + AA vs AA + A
-    # We can check that we use at least exactly the same number of tokens.
     for i, (spm_id, tok_id) in enumerate(zip(spm_ids, tok_ids)):
         if spm_id != tok_id:
             break
@@ -74,7 +58,6 @@ def check_details(line, spm_ids, tok_ids, slow, fast):
         return True
 
     if last - first > 5:
-        # We might have twice a single problem, attempt to subdivide the disjointed tokens into smaller problems
         spms = Counter(spm_ids[first:last])
         toks = Counter(tok_ids[first:last])
 
@@ -85,16 +68,11 @@ def check_details(line, spm_ids, tok_ids, slow, fast):
                 possible_matches = [
                     k
                     for k in range(last - first - min_width)
-                    if tok_ids[first + k : first + k + min_width] == spm_ids[first + i : first + i + min_width]
+                    if tok_ids[first + k:first + k + min_width] == spm_ids[first + i:first + i + min_width]
                 ]
                 for j in possible_matches:
-                    if check_diff(spm_ids[first : first + i], tok_ids[first : first + j], slow, fast) and check_details(
-                        line,
-                        spm_ids[first + i : last],
-                        tok_ids[first + j : last],
-                        slow,
-                        fast,
-                    ):
+                    if check_diff(spm_ids[first:first + i], tok_ids[first:first + j], slow, fast) and check_details(
+                            line, spm_ids[first + i:last], tok_ids[first + j:last], slow, fast):
                         return True
 
     print(f"Spm: {[fast.decode([spm_ids[i]]) for i in range(first, last)]}")
@@ -105,17 +83,13 @@ def check_details(line, spm_ids, tok_ids, slow, fast):
 
     fast.decode(spm_ids[:first])
     fast.decode(spm_ids[last:])
-    wrong = fast.decode(spm_ids[first:last])
-    print()
-    print(wrong)
+    wrong_decoded = fast.decode(spm_ids[first:last])
+    print("\n", wrong_decoded)
     return False
 
 
 def test_string(slow, fast, text):
-    global perfect
-    global imperfect
-    global wrong
-    global total
+    global perfect, imperfect, wrong, total
 
     slow_ids = slow.encode(text)
     fast_ids = fast.encode(text)
@@ -138,13 +112,12 @@ def test_string(slow, fast, text):
     if skip_assert:
         return
 
-    assert (
-        slow_ids == fast_ids
-    ), f"line {text} : \n\n{slow_ids}\n{fast_ids}\n\n{slow.tokenize(text)}\n{fast.tokenize(text)}"
+    assert slow_ids == fast_ids, f"line {text} : \n\n{slow_ids}\n{fast_ids}\n\n{slow.tokenize(text)}\n{fast.tokenize(text)}"
 
 
 def test_tokenizer(slow, fast):
-    global batch_total
+    global perfect, imperfect, wrong, total
+
     for i in range(len(dataset)):
         # premise, all languages
         for text in dataset[i]["premise"].values():
@@ -155,17 +128,28 @@ def test_tokenizer(slow, fast):
             test_string(slow, fast, text)
 
 
+def log_results(tokenizer_name, checkpoint, total, perfect, imperfect, wrong, start_time):
+    accuracy = (perfect / total) * 100 if total != 0 else 0
+    end_time = time.time()
+    elapsed_time = end_time - start_time
+    print(f"========================== Results for {tokenizer_name}: {checkpoint} ==========================")
+    print(f"Total: {total}, Perfect: {perfect}, Imperfect: {imperfect}, Wrong: {wrong}")
+    print(f"Accuracy: {accuracy:.2f}%")
+    print(f"Time taken: {elapsed_time:.2f} seconds")
+
+
 if __name__ == "__main__":
     for name, (slow_class, fast_class) in TOKENIZER_CLASSES.items():
         checkpoint_names = list(slow_class.max_model_input_sizes.keys())
         for checkpoint in checkpoint_names:
-            imperfect = 0
-            perfect = 0
-            wrong = 0
-            total = 0
+            imperfect, perfect, wrong, total = 0, 0, 0, 0
 
             print(f"========================== Checking {name}: {checkpoint} ==========================")
-            slow = slow_class.from_pretrained(checkpoint, force_download=True)
-            fast = fast_class.from_pretrained(checkpoint, force_download=True)
-            test_tokenizer(slow, fast)
-            print(f"Accuracy {perfect * 100 / total:.2f}")
+            start_time = time.time()
+            try:
+                slow = slow_class.from_pretrained(checkpoint, force_download=True)
+                fast = fast_class.from_pretrained(checkpoint, force_download=True)
+                test_tokenizer(slow, fast)
+                log_results(name, checkpoint, total, perfect, imperfect, wrong, start_time)
+            except Exception as e:
+                print(f"Error loading checkpoint {checkpoint} for tokenizer {name}: {e}")
